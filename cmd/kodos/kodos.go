@@ -105,11 +105,9 @@ func transform(ctx *kodos.Context, v ...*build.Package) []*kodos.Package {
 		}
 
 		pkgs = append(pkgs, &kodos.Package{
-			Context:    ctx,
-			ImportPath: src.ImportPath,
-			Dir:        src.Dir,
-			GoFiles:    src.GoFiles,
-			Main:       src.Name == "main",
+			Context: ctx,
+			Package: src,
+			Main:    src.Name == "main",
 		})
 	}
 	for _, p := range v {

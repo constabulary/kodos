@@ -2,6 +2,7 @@ package kodos
 
 import (
 	"fmt"
+	"go/build"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -47,14 +48,11 @@ func (c *Context) ctxString() string {
 // Package describes a set of Go files to be compiled.
 type Package struct {
 	*Context
-	ImportPath string
-	Dir        string
-	GoFiles    []string
-	Imports    []*Package
-	standard   bool // is this part of the stdlib
-	testScope  bool // is a test scoped packge
-	Main       bool // this is a command
-	NotStale   bool // this package _and_ all its dependencies are not stale
+	*build.Package
+	Imports   []*Package
+	testScope bool // is a test scoped package
+	Main      bool // this is a command
+	NotStale  bool // this package _and_ all its dependencies are not stale
 }
 
 const debug = true
@@ -75,7 +73,7 @@ func (pkg *Package) IsStale() bool {
 		return false
 	}
 
-	if !pkg.standard && pkg.force {
+	if pkg.force {
 		return true
 	}
 
@@ -105,16 +103,9 @@ func (pkg *Package) IsStale() bool {
 		return err != nil || fi.ModTime().Before(built)
 	}
 
-	if pkg.standard && !pkg.isCrossCompile() {
-		// if this is a standard lib package, and we are not cross compiling
-		// then assume the package is up to date. This also works around
-		// golang/go#13769.
-		return false
-	}
-
 	// Package is stale if a dependency is newer.
 	for _, p := range pkg.Imports {
-		if p.ImportPath == "C" || p.ImportPath == "unsafe" {
+		if p.Package.ImportPath == "C" || p.Package.ImportPath == "unsafe" {
 			continue // ignore stale imports of synthetic packages
 		}
 		if olderThan(p.pkgpath()) {
@@ -151,12 +142,9 @@ func (pkg *Package) pkgpath() string {
 	switch {
 	case pkg.isCrossCompile():
 		return filepath.Join(pkg.Pkgdir, importpath)
-	case pkg.standard && pkg.race:
+	case pkg.race:
 		// race enabled standard lib
 		return filepath.Join(runtime.GOROOT(), "pkg", pkg.GOOS+"_"+pkg.GOARCH+"_race", importpath)
-	case pkg.standard:
-		// standard lib
-		return filepath.Join(runtime.GOROOT(), "pkg", pkg.GOOS+"_"+pkg.GOARCH, importpath)
 	default:
 		return filepath.Join(pkg.Pkgdir, importpath)
 	}
@@ -195,7 +183,7 @@ func (pkg *Package) binname() string {
 }
 
 func (p *Package) complete() bool {
-	return true // no cgo or runtime code
+	return len(p.SFiles) == 0 // no cgo or runtime code
 }
 
 func (p *Package) name() string { return filepath.FromSlash(p.ImportPath) }
@@ -209,12 +197,38 @@ func stringList(args ...[]string) []string {
 }
 
 func (pkg *Package) Compile() error {
+	if err := mkdir(filepath.Dir(pkg.pkgpath())); err != nil {
+		return err
+	}
+	asm := func(pkg *Package, ofile, sfile string) error {
+		args := []string{"-o", ofile, "-D", "GOOS_" + runtime.GOOS, "-D", "GOARCH_" + runtime.GOARCH}
+		odir := filepath.Join(filepath.Dir(ofile))
+		includedir := filepath.Join(runtime.GOROOT(), "pkg", "include")
+		args = append(args, "-I", odir, "-I", includedir)
+		args = append(args, sfile)
+		if err := mkdir(filepath.Dir(ofile)); err != nil {
+			return err
+		}
+		cmd := exec.Command(filepath.Join(runtime.GOROOT(), "pkg", "tool", runtime.GOOS+"_"+runtime.GOARCH, "asm"), args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Dir = pkg.Dir
+		fmt.Fprintf(os.Stderr, "+ %s\n", strings.Join(cmd.Args, " "))
+		return cmd.Run()
+	}
+
+	for _, sfile := range pkg.SFiles {
+		if err := asm(pkg, filepath.Join(filepath.Dir(pkg.pkgpath()), strings.TrimSuffix(sfile, ".s")+".o"), sfile); err != nil {
+			return err
+		}
+	}
+
 	args := append(pkg.gcflags, "-p", pkg.ImportPath, "-pack")
 	args = append(args, "-o", pkg.pkgpath())
 	for _, d := range pkg.searchPaths() {
 		args = append(args, "-I", d)
 	}
-	if pkg.standard && pkg.ImportPath == "runtime" {
+	if pkg.ImportPath == "runtime" {
 		// runtime compiles with a special gc flag to emit
 		// additional reflect type data.
 		args = append(args, "-+")
@@ -226,9 +240,6 @@ func (pkg *Package) Compile() error {
 	}
 
 	args = append(args, pkg.GoFiles...)
-	if err := mkdir(filepath.Dir(pkg.pkgpath())); err != nil {
-		return err
-	}
 	cmd := exec.Command(filepath.Join(runtime.GOROOT(), "pkg", "tool", runtime.GOOS+"_"+runtime.GOARCH, "compile"), args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
