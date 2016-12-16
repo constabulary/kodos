@@ -96,6 +96,22 @@ func transform(ctx *kodos.Context, v ...*build.Package) []*kodos.Package {
 		}
 		seen[src.ImportPath] = true
 
+		// all binaries depend on runtime, even if they do not
+		// explicitly import it.
+
+		imports := src.Imports
+
+		if src.ImportPath != "runtime" {
+			// all binaries depend on runtime, even if they do not
+			// explicitly import it.
+			imports = append(imports, "runtime")
+			const race = false
+			if race {
+				// race binaries have extra implicit depdendenceis.
+				imports = append(imports, "runtime/race")
+			}
+		}
+
 		for _, i := range src.Imports {
 			pkg, ok := srcs[i]
 			if !ok {

@@ -3,6 +3,7 @@ package kodos
 import (
 	"fmt"
 	"go/build"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -183,7 +184,12 @@ func (pkg *Package) binname() string {
 }
 
 func (p *Package) complete() bool {
-	return len(p.SFiles) == 0 // no cgo or runtime code
+	switch p.ImportPath {
+	case "bytes", "net", "os", "runtime/pprof", "sync", "time":
+		return false
+	default:
+		return len(p.SFiles) == 0 // no cgo or runtime code
+	}
 }
 
 func (p *Package) name() string { return filepath.FromSlash(p.ImportPath) }
@@ -197,55 +203,77 @@ func stringList(args ...[]string) []string {
 }
 
 func (pkg *Package) Compile() error {
-	if err := mkdir(filepath.Dir(pkg.pkgpath())); err != nil {
-		return err
+	var gofiles []string
+	gofiles = append(gofiles, pkg.GoFiles...)
+	if len(gofiles) == 0 {
+		return fmt.Errorf("compile %q: no go files supplied", pkg.ImportPath)
 	}
+	ofiles := []string{pkg.objfile()}
+
+	run := func(dir, tool string, args ...string) error {
+		cmd := exec.Command(filepath.Join(runtime.GOROOT(), "pkg", "tool", runtime.GOOS+"_"+runtime.GOARCH, tool), args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Dir = dir
+		fmt.Fprintf(os.Stderr, "+ %s\n", strings.Join(cmd.Args, " "))
+		return cmd.Run()
+	}
+
+	gc := func(pkg *Package) error {
+		args := append(pkg.gcflags, "-p", pkg.ImportPath)
+		args = append(args, "-o", ofiles[0])
+		for _, d := range pkg.searchPaths() {
+			args = append(args, "-I", d)
+		}
+		if pkg.ImportPath == "runtime" {
+			// runtime compiles with a special gc flag to emit
+			// additional reflect type data.
+			args = append(args, "-+")
+		}
+
+		switch {
+		case pkg.complete():
+			args = append(args, "-complete", "-pack")
+		default:
+			asmhdr := filepath.Join(filepath.Dir(pkg.objfile()), "go_asm.h")
+			args = append(args, "-asmhdr", asmhdr, "-pack")
+		}
+		return run(pkg.Dir, "compile", append(args, gofiles...)...)
+	}
+
 	asm := func(pkg *Package, ofile, sfile string) error {
+		ofiles = append(ofiles, ofile)
 		args := []string{"-o", ofile, "-D", "GOOS_" + runtime.GOOS, "-D", "GOARCH_" + runtime.GOARCH}
 		odir := filepath.Join(filepath.Dir(ofile))
 		includedir := filepath.Join(runtime.GOROOT(), "pkg", "include")
 		args = append(args, "-I", odir, "-I", includedir)
 		args = append(args, sfile)
-		if err := mkdir(filepath.Dir(ofile)); err != nil {
-			return err
-		}
-		cmd := exec.Command(filepath.Join(runtime.GOROOT(), "pkg", "tool", runtime.GOOS+"_"+runtime.GOARCH, "asm"), args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Dir = pkg.Dir
-		fmt.Fprintf(os.Stderr, "+ %s\n", strings.Join(cmd.Args, " "))
-		return cmd.Run()
+		return run(pkg.Dir, "asm", args...)
 	}
 
+	pack := func(pkg *Package, afiles ...string) error {
+		args := []string{"r"}
+		args = append(args, afiles...)
+		return run(pkg.Dir, "pack", args...)
+	}
+
+	if err := mkdir(filepath.Dir(pkg.pkgpath())); err != nil {
+		return err
+	}
+	if err := gc(pkg); err != nil {
+		return nil
+	}
 	for _, sfile := range pkg.SFiles {
-		if err := asm(pkg, filepath.Join(filepath.Dir(pkg.pkgpath()), strings.TrimSuffix(sfile, ".s")+".o"), sfile); err != nil {
+		if err := asm(pkg, filepath.Join(filepath.Dir(pkg.objfile()), strings.TrimSuffix(sfile, ".s")+".o"), sfile); err != nil {
 			return err
 		}
 	}
-
-	args := append(pkg.gcflags, "-p", pkg.ImportPath, "-pack")
-	args = append(args, "-o", pkg.pkgpath())
-	for _, d := range pkg.searchPaths() {
-		args = append(args, "-I", d)
+	if len(ofiles) > 1 {
+		if err := pack(pkg, ofiles...); err != nil {
+			return err
+		}
 	}
-	if pkg.ImportPath == "runtime" {
-		// runtime compiles with a special gc flag to emit
-		// additional reflect type data.
-		args = append(args, "-+")
-	}
-
-	switch {
-	case pkg.complete():
-		args = append(args, "-complete")
-	}
-
-	args = append(args, pkg.GoFiles...)
-	cmd := exec.Command(filepath.Join(runtime.GOROOT(), "pkg", "tool", runtime.GOOS+"_"+runtime.GOARCH, "compile"), args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Dir = pkg.Dir
-	fmt.Fprintf(os.Stderr, "+ %s\n", strings.Join(cmd.Args, " "))
-	return cmd.Run()
+	return copyfile(pkg.installpath(), ofiles[0])
 }
 
 func (pkg *Package) Link() error {
@@ -281,6 +309,35 @@ func (pkg *Package) Link() error {
 	return rename(tmp.Name(), pkg.Binfile())
 }
 
+// objfile returns the name of the object file for this package
+func (pkg *Package) objfile() string {
+	return filepath.Join(pkg.Workdir, pkg.objname())
+}
+
+func (pkg *Package) objname() string {
+	return pkg.pkgname() + ".a"
+}
+
+func (pkg *Package) pkgname() string {
+	return filepath.Base(filepath.FromSlash(pkg.ImportPath))
+}
+
+// installpath returns the distination to cache this package's compiled .a file.
+// pkgpath and installpath differ in that the former returns the location where you will find
+// a previously cached .a file, the latter returns the location where an installed file
+// will be placed.
+//
+// The difference is subtle. pkgpath must deal with the possibility that the file is from the
+// standard library and is previously compiled. installpath will always return a path for the
+// project's pkg/ directory in the case that the stdlib is out of date, or not compiled for
+// a specific architecture.
+func (pkg *Package) installpath() string {
+	if pkg.testScope {
+		panic("installpath called with test scope")
+	}
+	return filepath.Join(pkg.Pkgdir, filepath.FromSlash(pkg.ImportPath)+".a")
+}
+
 func mkdir(path string) error {
 	return os.MkdirAll(path, 0755)
 }
@@ -288,4 +345,25 @@ func mkdir(path string) error {
 func rename(from, to string) error {
 	fmt.Fprintf(os.Stderr, "+ mv %s %s\n", from, to)
 	return os.Rename(from, to)
+}
+
+// copyfile copies file to destination creating destination directory if needed
+func copyfile(dst, src string) error {
+	err := mkdir(filepath.Dir(dst))
+	if err != nil {
+		return err
+	}
+	r, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	w, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	fmt.Fprintln(os.Stderr, "+ cp", src, dst)
+	_, err = io.Copy(w, r)
+	return err
 }
