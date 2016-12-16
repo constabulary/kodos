@@ -275,9 +275,8 @@ func loadDependencies(rootdir string, srcs ...*build.Package) []*build.Package {
 	load := func(path string) *build.Package {
 		fmt.Println("searching", path, "in", filepath.Join(runtime.GOROOT(), "src"), "(GOROOT)")
 		dir := filepath.Join(runtime.GOROOT(), "src", path)
-		_, err := os.Stat(dir)
-		if os.IsNotExist(err) {
-			fatal("cannot resolve path ", path)
+		if _, err := os.Stat(dir); err != nil {
+			fatal("cannot resolve path ", path, err.Error())
 		}
 		return importPath(path, dir)
 	}
