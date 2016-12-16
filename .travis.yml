@@ -10,5 +10,5 @@ install:
   - true
 
 script:
-  - go build -o $HOME/kodos -v
+  - go build -o $HOME/kodos -v github.com/constabulary/kodos/cmd/kodos
   - $HOME/kodos
