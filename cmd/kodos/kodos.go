@@ -59,12 +59,8 @@ func main() {
 		}
 
 		srcs = loadDependencies(dir, srcs...)
-
-		pkgs := transform(ctx, srcs...)
-		computeStale(pkgs...)
-
-		targets := make(map[string]func() error)
-		fn, err := buildPackages(targets, pkgs...)
+		pkgs := ctx.Transform(srcs...)
+		fn, err := buildPackages(pkgs...)
 		check(err)
 		check(fn())
 	default:
@@ -76,88 +72,6 @@ func cwd() string {
 	wd, err := os.Getwd()
 	check(err)
 	return wd
-}
-
-// transform takes a slice of go/build.Package and returns the
-// corresponding slice of kodos.Packages.
-func transform(ctx *kodos.Context, v ...*build.Package) []*kodos.Package {
-	srcs := make(map[string]*build.Package)
-	for _, pkg := range v {
-		srcs[pkg.ImportPath] = pkg
-	}
-
-	seen := make(map[string]*kodos.Package)
-
-	var walk func(src *build.Package) *kodos.Package
-	walk = func(src *build.Package) *kodos.Package {
-		if pkg, ok := seen[src.ImportPath]; ok {
-			return pkg
-		}
-
-		// all binaries depend on runtime, even if they do not
-		// explicitly import it.
-
-		var deps []*kodos.Package
-		for _, i := range src.Imports {
-			pkg, ok := srcs[i]
-			if !ok {
-				fatal("transform: pkg ", i, "is not loaded")
-			}
-			deps = append(deps, walk(pkg))
-		}
-
-		pkg := &kodos.Package{
-			Context: ctx,
-			Package: src,
-			Main:    src.Name == "main",
-			Imports: deps,
-		}
-		seen[src.ImportPath] = pkg
-		return pkg
-	}
-
-	var pkgs []*kodos.Package
-	for _, p := range v {
-		pkgs = append(pkgs, walk(p))
-	}
-
-	check := make(map[*kodos.Package]bool)
-	for _, p := range pkgs {
-		if check[p] {
-			fatal(p.ImportPath, "present twice")
-		}
-		check[p] = true
-	}
-
-	return pkgs
-}
-
-// computeStale sets the UpToDate flag on a set of package roots.
-func computeStale(roots ...*kodos.Package) {
-	seen := make(map[*kodos.Package]bool)
-
-	var walk func(pkg *kodos.Package) bool
-	walk = func(pkg *kodos.Package) bool {
-		if seen[pkg] {
-			return pkg.NotStale
-		}
-		seen[pkg] = true
-
-		for _, i := range pkg.Imports {
-			if !walk(i) {
-				// a dep is stale so we are stale
-				return false
-			}
-		}
-
-		stale := pkg.IsStale()
-		pkg.NotStale = !stale
-		return !stale
-	}
-
-	for _, root := range roots {
-		walk(root)
-	}
 }
 
 // findreporoot returns the location of the closest .git directory
@@ -182,7 +96,8 @@ func findreporoot(dir string) (string, error) {
 	}
 }
 
-func buildPackages(targets map[string]func() error, pkgs ...*kodos.Package) (func() error, error) {
+func buildPackages(pkgs ...*kodos.Package) (func() error, error) {
+	targets := make(map[string]func() error)
 	var deps []func() error
 	for _, pkg := range pkgs {
 		fn, err := buildPackage(targets, pkg)
@@ -228,6 +143,11 @@ func buildPackage(targets map[string]func() error, pkg *kodos.Package) (func() e
 
 	// step 2. build this package
 	build := func() error {
+		for _, dep := range deps {
+			if err := dep(); err != nil {
+				return err
+			}
+		}
 		if err := pkg.Compile(); err != nil {
 			return err
 		}

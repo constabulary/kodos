@@ -367,3 +367,91 @@ func copyfile(dst, src string) error {
 	_, err = io.Copy(w, r)
 	return err
 }
+
+// Transform takes a slice of go/build.Package and returns the
+// corresponding slice of kodos.Packages.
+func (ctx *Context) Transform(v ...*build.Package) []*Package {
+	pkgs := transform(ctx, v...)
+	computeStale(pkgs...)
+	return pkgs
+}
+
+func transform(ctx *Context, v ...*build.Package) []*Package {
+	srcs := make(map[string]*build.Package)
+	for _, pkg := range v {
+		srcs[pkg.ImportPath] = pkg
+	}
+
+	seen := make(map[string]*Package)
+
+	var walk func(src *build.Package) *Package
+	walk = func(src *build.Package) *Package {
+		if pkg, ok := seen[src.ImportPath]; ok {
+			return pkg
+		}
+
+		// all binaries depend on runtime, even if they do not
+		// explicitly import it.
+
+		var deps []*Package
+		for _, i := range src.Imports {
+			pkg, ok := srcs[i]
+			if !ok {
+				panic(fmt.Sprintln("transform: pkg ", i, "is not loaded"))
+			}
+			deps = append(deps, walk(pkg))
+		}
+
+		pkg := &Package{
+			Context: ctx,
+			Package: src,
+			Main:    src.Name == "main",
+			Imports: deps,
+		}
+		seen[src.ImportPath] = pkg
+		return pkg
+	}
+
+	var pkgs []*Package
+	for _, p := range v {
+		pkgs = append(pkgs, walk(p))
+	}
+
+	check := make(map[*Package]bool)
+	for _, p := range pkgs {
+		if check[p] {
+			panic(fmt.Sprintln(p.ImportPath, "present twice"))
+		}
+		check[p] = true
+	}
+
+	return pkgs
+}
+
+// computeStale sets the UpToDate flag on a set of package roots.
+func computeStale(roots ...*Package) {
+	seen := make(map[*Package]bool)
+
+	var walk func(pkg *Package) bool
+	walk = func(pkg *Package) bool {
+		if seen[pkg] {
+			return pkg.NotStale
+		}
+		seen[pkg] = true
+
+		for _, i := range pkg.Imports {
+			if !walk(i) {
+				// a dep is stale so we are stale
+				return false
+			}
+		}
+
+		stale := pkg.IsStale()
+		pkg.NotStale = !stale
+		return !stale
+	}
+
+	for _, root := range roots {
+		walk(root)
+	}
+}
