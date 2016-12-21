@@ -86,49 +86,49 @@ func transform(ctx *kodos.Context, v ...*build.Package) []*kodos.Package {
 		srcs[pkg.ImportPath] = pkg
 	}
 
-	var pkgs []*kodos.Package
-	seen := make(map[string]bool)
+	seen := make(map[string]*kodos.Package)
 
-	var walk func(src *build.Package)
-	walk = func(src *build.Package) {
-		if seen[src.ImportPath] {
-			return
+	var walk func(src *build.Package) *kodos.Package
+	walk = func(src *build.Package) *kodos.Package {
+		if pkg, ok := seen[src.ImportPath]; ok {
+			return pkg
 		}
-		seen[src.ImportPath] = true
 
 		// all binaries depend on runtime, even if they do not
 		// explicitly import it.
 
-		imports := src.Imports
-
-		if src.ImportPath != "runtime" {
-			// all binaries depend on runtime, even if they do not
-			// explicitly import it.
-			imports = append(imports, "runtime")
-			const race = false
-			if race {
-				// race binaries have extra implicit depdendenceis.
-				imports = append(imports, "runtime/race")
-			}
-		}
-
+		var deps []*kodos.Package
 		for _, i := range src.Imports {
 			pkg, ok := srcs[i]
 			if !ok {
 				fatal("transform: pkg ", i, "is not loaded")
 			}
-			walk(pkg)
+			deps = append(deps, walk(pkg))
 		}
 
-		pkgs = append(pkgs, &kodos.Package{
+		pkg := &kodos.Package{
 			Context: ctx,
 			Package: src,
 			Main:    src.Name == "main",
-		})
+			Imports: deps,
+		}
+		seen[src.ImportPath] = pkg
+		return pkg
 	}
+
+	var pkgs []*kodos.Package
 	for _, p := range v {
-		walk(p)
+		pkgs = append(pkgs, walk(p))
 	}
+
+	check := make(map[*kodos.Package]bool)
+	for _, p := range pkgs {
+		if check[p] {
+			fatal(p.ImportPath, "present twice")
+		}
+		check[p] = true
+	}
+
 	return pkgs
 }
 
@@ -201,8 +201,8 @@ func buildPackages(targets map[string]func() error, pkgs ...*kodos.Package) (fun
 
 func buildPackage(targets map[string]func() error, pkg *kodos.Package) (func() error, error) {
 
-	// if this action is already present in the map, return it
-	// rather than creating a new action.
+	// if this action is already present in the map, return an
+	// empty action
 	if fn, ok := targets[pkg.ImportPath]; ok {
 		return fn, nil
 	}
@@ -212,7 +212,6 @@ func buildPackage(targets map[string]func() error, pkg *kodos.Package) (func() e
 	// dependencies are stale, so ignore this whole tree.
 	if pkg.NotStale {
 		return func() error {
-			fmt.Println(pkg.ImportPath, "is up to date")
 			return nil
 		}, nil
 	}
@@ -229,11 +228,6 @@ func buildPackage(targets map[string]func() error, pkg *kodos.Package) (func() e
 
 	// step 2. build this package
 	build := func() error {
-		for _, dep := range deps {
-			if err := dep(); err != nil {
-				return err
-			}
-		}
 		if err := pkg.Compile(); err != nil {
 			return err
 		}
@@ -287,7 +281,6 @@ func loadSources(prefix string, dir string) []*build.Package {
 
 func loadDependencies(rootdir string, srcs ...*build.Package) []*build.Package {
 	load := func(path string) *build.Package {
-		fmt.Println("searching", path, "in", filepath.Join(runtime.GOROOT(), "src"), "(GOROOT)")
 		dir := filepath.Join(runtime.GOROOT(), "src", path)
 		if _, err := os.Stat(dir); err != nil {
 			fatal("cannot resolve path ", path, err.Error())
