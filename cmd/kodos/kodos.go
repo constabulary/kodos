@@ -60,7 +60,7 @@ func main() {
 
 		srcs = loadDependencies(dir, srcs...)
 		pkgs := ctx.Transform(srcs...)
-		fn, err := buildPackages(pkgs...)
+		fn, err := kodos.BuildPackages(pkgs...)
 		check(err)
 		check(fn())
 	default:
@@ -94,74 +94,6 @@ func findreporoot(dir string) (string, error) {
 		}
 		dir = d
 	}
-}
-
-func buildPackages(pkgs ...*kodos.Package) (func() error, error) {
-	targets := make(map[string]func() error)
-	var deps []func() error
-	for _, pkg := range pkgs {
-		fn, err := buildPackage(targets, pkg)
-		check(err)
-		deps = append(deps, fn)
-	}
-	return func() error {
-		for _, fn := range deps {
-			if err := fn(); err != nil {
-				return err
-			}
-		}
-		return nil
-	}, nil
-}
-
-func buildPackage(targets map[string]func() error, pkg *kodos.Package) (func() error, error) {
-
-	// if this action is already present in the map, return an
-	// empty action
-	if fn, ok := targets[pkg.ImportPath]; ok {
-		return fn, nil
-	}
-
-	// step 0. are we stale ?
-	// if this package is not stale, then by definition none of its
-	// dependencies are stale, so ignore this whole tree.
-	if pkg.NotStale {
-		return func() error {
-			return nil
-		}, nil
-	}
-
-	// step 1. build dependencies
-	var deps []func() error
-	for _, pkg := range pkg.Imports {
-		fn, err := buildPackage(targets, pkg)
-		if err != nil {
-			return nil, err
-		}
-		deps = append(deps, fn)
-	}
-
-	// step 2. build this package
-	build := func() error {
-		for _, dep := range deps {
-			if err := dep(); err != nil {
-				return err
-			}
-		}
-		if err := pkg.Compile(); err != nil {
-			return err
-		}
-		if !pkg.Main {
-			return nil // we're done
-		}
-		return pkg.Link()
-	}
-
-	// record the final action as the action that represents
-	// building this package.
-	targets[pkg.ImportPath] = build
-
-	return build, nil
 }
 
 func loadSources(prefix string, dir string) []*build.Package {
